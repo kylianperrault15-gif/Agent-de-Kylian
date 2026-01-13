@@ -1,0 +1,7 @@
+{
+  "name": "Copy of Donovan - Assistant de Kylian",
+  "description": "Assistant IA vocal interactif représentant le profil professionnel de Kylian Perrault.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
