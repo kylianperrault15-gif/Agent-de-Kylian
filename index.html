@@ -8,16 +8,15 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
-        body { font-family: 'Inter', sans-serif; margin: 0; overflow: hidden; }
-        .glass { background: rgba(255, 255, 255, 0.05); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.1); }
+        body { font-family: 'Inter', sans-serif; margin: 0; background-color: #020617; color: #f8fafc; overflow-x: hidden; }
+        .glass { background: rgba(255, 255, 255, 0.03); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); }
         .pulse { animation: pulse 2s infinite; }
         @keyframes pulse {
             0% { transform: scale(1); opacity: 1; }
             50% { transform: scale(1.1); opacity: 0.7; }
             100% { transform: scale(1); opacity: 1; }
         }
-        ::-webkit-scrollbar { width: 6px; }
-        ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 10px; }
+        .voice-bar { transition: height 0.1s ease; }
     </style>
     <script type="importmap">
 {
@@ -26,14 +25,220 @@
     "react-dom": "https://esm.sh/react-dom@19.0.0",
     "react-dom/client": "https://esm.sh/react-dom@19.0.0/client",
     "@google/genai": "https://esm.sh/@google/genai@1.35.0",
-    "react-dom/": "https://esm.sh/react-dom@^19.2.3/",
     "react/": "https://esm.sh/react@^19.2.3/"
   }
 }
 </script>
 </head>
-<body class="bg-slate-950 text-slate-100">
+<body>
     <div id="root"></div>
-    <script type="module" src="index.tsx"></script>
+
+    <script type="module">
+        import React, { useState, useRef, useEffect } from 'react';
+        import { createRoot } from 'react-dom/client';
+        import { GoogleGenAI, Modality } from '@google/genai';
+
+        // --- DONNÉES DU CV & INSTRUCTIONS ---
+        const KYLIAN_CV_DATA = `
+        Nom: Kylian Perrault, 22 ans.
+        Formations: MSc Manager (Inseec Paris), Bachelor Dev Commercial (EBBS).
+        Expériences: Vice-Président Co-fondateur Kryptosphère INSEEC, Responsable Com/Marketing Paymium, Créateur Azaios, Conseiller Goossens Paris (Chanel), Assistant Unaju.
+        Compétences: Web3, IA, Luxe, Marketing, Vente.
+        `;
+
+        const SYSTEM_INSTRUCTION = `
+        Tu es Donovan, l'assistant IA de Kylian Perrault. 
+        Ton script d'ouverture est : "Bonjour, je suis Donovan, l'assistant de Kylian, que voulez-vous savoir à propos de lui ?"
+        Sois pro, chaleureux et élégant. Parle de Kylian à la 3ème personne.
+        Données : ${KYLIAN_CV_DATA}
+        `;
+
+        // --- UTILITAIRES AUDIO ---
+        function decode(base64) {
+            const binaryString = atob(base64);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
+            return bytes;
+        }
+
+        function encode(bytes) {
+            let binary = '';
+            for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+            return btoa(binary);
+        }
+
+        async function decodeAudioData(data, ctx, sampleRate, numChannels) {
+            const dataInt16 = new Int16Array(data.buffer);
+            const frameCount = dataInt16.length / numChannels;
+            const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+            for (let channel = 0; channel < numChannels; channel++) {
+                const channelData = buffer.getChannelData(channel);
+                for (let i = 0; i < frameCount; i++) channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
+            }
+            return buffer;
+        }
+
+        // --- COMPOSANT PRINCIPAL ---
+        const App = () => {
+            const [isActive, setIsActive] = useState(false);
+            const [isConnecting, setIsConnecting] = useState(false);
+            const [messages, setMessages] = useState([]);
+            
+            const audioCtxRef = useRef(null);
+            const outCtxRef = useRef(null);
+            const nextStartTimeRef = useRef(0);
+            const sourcesRef = useRef(new Set());
+            const transcriptRef = useRef({ input: '', output: '' });
+
+            const stopSession = () => {
+                setIsActive(false);
+                setIsConnecting(false);
+                if (audioCtxRef.current) audioCtxRef.current.close();
+                if (outCtxRef.current) outCtxRef.current.close();
+                sourcesRef.current.forEach(s => { try { s.stop(); } catch(e){} });
+                sourcesRef.current.clear();
+            };
+
+            const startSession = async () => {
+                if (isConnecting || isActive) return;
+                setIsConnecting(true);
+
+                try {
+                    const ai = new GoogleGenAI({ apiKey: window.process?.env?.API_KEY || "" });
+                    audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                    outCtxRef.current = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+                    
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    
+                    const sessionPromise = ai.live.connect({
+                        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+                        callbacks: {
+                            onopen: () => {
+                                setIsActive(true);
+                                setIsConnecting(false);
+                                const source = audioCtxRef.current.createMediaStreamSource(stream);
+                                const processor = audioCtxRef.current.createScriptProcessor(4096, 1, 1);
+                                processor.onaudioprocess = (e) => {
+                                    const input = e.inputBuffer.getChannelData(0);
+                                    const int16 = new Int16Array(input.length);
+                                    for (let i = 0; i < input.length; i++) int16[i] = input[i] * 32768;
+                                    sessionPromise.then(s => s.sendRealtimeInput({ 
+                                        media: { data: encode(new Uint8Array(int16.buffer)), mimeType: 'audio/pcm;rate=16000' } 
+                                    })).catch(() => {});
+                                };
+                                source.connect(processor);
+                                processor.connect(audioCtxRef.current.destination);
+                            },
+                            onmessage: async (msg) => {
+                                if (msg.serverContent?.outputTranscription) transcriptRef.current.output += msg.serverContent.outputTranscription.text;
+                                if (msg.serverContent?.inputTranscription) transcriptRef.current.input += msg.serverContent.inputTranscription.text;
+                                if (msg.serverContent?.turnComplete) {
+                                    const { input, output } = transcriptRef.current;
+                                    if (input || output) setMessages(p => [...p, { role: 'user', text: input }, { role: 'assistant', text: output }].filter(m => m.text));
+                                    transcriptRef.current = { input: '', output: '' };
+                                }
+                                const audio = msg.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
+                                if (audio && outCtxRef.current) {
+                                    const ctx = outCtxRef.current;
+                                    nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+                                    const buffer = await decodeAudioData(decode(audio), ctx, 24000, 1);
+                                    const s = ctx.createBufferSource();
+                                    s.buffer = buffer;
+                                    s.connect(ctx.destination);
+                                    s.onended = () => sourcesRef.current.delete(s);
+                                    s.start(nextStartTimeRef.current);
+                                    nextStartTimeRef.current += buffer.duration;
+                                    sourcesRef.current.add(s);
+                                }
+                                if (msg.serverContent?.interrupted) {
+                                    sourcesRef.current.forEach(s => { try { s.stop(); } catch(e){} });
+                                    sourcesRef.current.clear();
+                                    nextStartTimeRef.current = 0;
+                                }
+                            },
+                            onerror: stopSession,
+                            onclose: stopSession
+                        },
+                        config: {
+                            responseModalities: [Modality.AUDIO],
+                            systemInstruction: SYSTEM_INSTRUCTION,
+                            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Charon' } } },
+                            inputAudioTranscription: {},
+                            outputAudioTranscription: {}
+                        }
+                    });
+                } catch (e) {
+                    console.error(e);
+                    setIsConnecting(false);
+                    stopSession();
+                }
+            };
+
+            return React.createElement('div', { className: "flex flex-col h-screen max-w-5xl mx-auto p-4 md:p-10" }, [
+                // Header
+                React.createElement('header', { key: 'h', className: "flex items-center justify-between mb-10" }, [
+                    React.createElement('div', { className: "flex items-center gap-5" }, [
+                        React.createElement('div', { className: "w-14 h-14 rounded-2xl bg-indigo-600 flex items-center justify-center text-2xl font-black shadow-lg shadow-indigo-500/20" }, "D"),
+                        React.createElement('div', null, [
+                            React.createElement('h1', { className: "text-2xl font-bold text-white" }, "Donovan"),
+                            React.createElement('p', { className: "text-slate-400 text-sm" }, "Assistant de Kylian Perrault")
+                        ])
+                    ]),
+                    React.createElement('div', { className: "glass px-4 py-2 rounded-full flex items-center gap-2" }, [
+                        React.createElement('div', { className: `w-2 h-2 rounded-full ${isActive ? 'bg-green-500 animate-pulse' : 'bg-slate-600'}` }),
+                        React.createElement('span', { className: "text-[10px] font-bold uppercase tracking-widest" }, isActive ? 'Actif' : 'Hors ligne')
+                    ])
+                ]),
+                // Main
+                React.createElement('main', { key: 'm', className: "flex-1 flex flex-col gap-6 min-h-0" }, [
+                    React.createElement('div', { className: "relative flex-1 rounded-[2.5rem] glass flex flex-col items-center justify-center p-8 text-center" }, 
+                        !isActive && !isConnecting ? [
+                            React.createElement('div', { className: "w-24 h-24 mx-auto bg-slate-900 rounded-full flex items-center justify-center text-4xl mb-6 shadow-2xl" }, "🎙️"),
+                            React.createElement('h2', { className: "text-2xl font-bold mb-4" }, "Prêt à discuter ?"),
+                            React.createElement('p', { className: "text-slate-400 mb-8 max-w-sm mx-auto" }, "Posez-moi vos questions sur le parcours, les compétences ou les projets de Kylian."),
+                            React.createElement('button', { 
+                                onClick: startSession,
+                                className: "w-full py-4 bg-white text-slate-950 rounded-2xl font-bold text-lg hover:bg-slate-200 transition-all active:scale-95 shadow-xl"
+                            }, "Parler à Donovan")
+                        ] : isConnecting ? [
+                            React.createElement('div', { className: "w-16 h-16 border-4 border-indigo-500/20 border-t-indigo-500 rounded-full animate-spin mb-4" }),
+                            React.createElement('p', { className: "animate-pulse text-slate-400" }, "Connexion en cours...")
+                        ] : [
+                            React.createElement('div', { className: "relative w-48 h-48 rounded-full border-2 border-indigo-500/20 flex items-center justify-center" }, [
+                                React.createElement('div', { className: "absolute inset-0 border border-indigo-500/40 rounded-full pulse" }),
+                                React.createElement('div', { className: "w-32 h-32 rounded-full bg-slate-800 flex items-center justify-center" }, 
+                                    React.createElement('div', { className: "flex gap-1 items-end h-8" }, [1,2,3,4].map(i => 
+                                        React.createElement('div', { key: i, className: "w-1.5 bg-indigo-500 rounded-full animate-bounce", style: { height: `${Math.random()*100}%` } })
+                                    ))
+                                )
+                            ]),
+                            React.createElement('p', { className: "mt-8 text-xl font-medium" }, "Je vous écoute..."),
+                            React.createElement('button', { 
+                                onClick: stopSession,
+                                className: "mt-10 px-8 py-2 border border-red-500/30 text-red-500 rounded-xl font-bold hover:bg-red-500 hover:text-white transition-all"
+                            }, "Raccrocher")
+                        ]
+                    ),
+                    // Transcript
+                    messages.length > 0 && React.createElement('div', { className: "h-40 glass rounded-3xl p-6 overflow-y-auto space-y-3" }, 
+                        messages.map((m, i) => React.createElement('div', { key: i, className: `flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}` }, 
+                            React.createElement('div', { className: `max-w-[80%] p-3 rounded-2xl text-sm ${m.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-slate-800 text-slate-200'}` }, m.text)
+                        ))
+                    )
+                ]),
+                // Footer
+                React.createElement('footer', { key: 'f', className: "mt-8 grid grid-cols-2 md:grid-cols-4 gap-4" }, 
+                    ['Web3 & IA', 'Inseec Paris', 'Alternant Paymium', 'Paris'].map((v, i) => 
+                        React.createElement('div', { key: i, className: "glass p-4 rounded-2xl text-center" }, 
+                            React.createElement('p', { className: "text-xs font-bold text-slate-300" }, v)
+                        )
+                    )
+                )
+            ]);
+        };
+
+        const root = createRoot(document.getElementById('root'));
+        root.render(React.createElement(App));
+    </script>
 </body>
 </html>
